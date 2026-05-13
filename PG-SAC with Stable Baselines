@@ -1,0 +1,216 @@
+# PG-SAC with Stable Baselines
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import pybullet as p
+import pybullet_data
+from collections import deque
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import BaseCallback
+import matplotlib.pyplot as plt
+
+# ================================
+# Environment
+# ================================
+class ArmEnv(gym.Env):
+    def __init__(self):
+        super().__init__()
+        self.client = p.connect(p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+        p.loadURDF("plane.urdf")
+        self.robot = p.loadURDF(
+            "kuka_iiwa/model.urdf", [0,0,0], useFixedBase=True)
+        self.num_joints = 6
+        self.dt = 1.0/240.0
+        self.max_steps = 200
+        self.joint_limits = [
+            (-2.96, 2.96), (-2.09, 2.09),
+            (-2.96, 2.96), (-2.09, 2.09),
+            (-2.96, 2.96), (-2.09, 2.09),
+        ]
+
+        # Observation & Action space
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(17,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
+
+        self.reset()
+
+    def _get_reachable_target(self):
+        angles = [np.random.uniform(l*0.5, h*0.5)
+                 for l, h in self.joint_limits]
+        for i, a in enumerate(angles):
+            p.resetJointState(self.robot, i, a)
+        return np.array(p.getLinkState(self.robot, 6)[0])
+
+    def reset(self, seed=None, options=None):
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.81)
+        p.loadURDF("plane.urdf")
+        self.robot = p.loadURDF(
+            "kuka_iiwa/model.urdf", [0,0,0], useFixedBase=True)
+
+        self.target_pos = self._get_reachable_target()
+
+        for i in range(self.num_joints):
+            start = np.random.uniform(
+                self.joint_limits[i][0]*0.3,
+                self.joint_limits[i][1]*0.3)
+            p.resetJointState(self.robot, i, start)
+
+        p.setJointMotorControl2(
+            self.robot, 6, p.POSITION_CONTROL, 0, force=0)
+
+        self.step_count = 0
+        self.prev_torques = np.zeros(self.num_joints)
+        self.energy_window = deque(maxlen=10)
+        self.prev_error = None
+        self.total_energy = 0
+        self.total_jerk = 0
+
+        return self._get_state(), {}
+
+    def _get_ee_pos(self):
+        return np.array(p.getLinkState(self.robot, 6)[0])
+
+    def _get_state(self):
+        js = [p.getJointState(self.robot, i)
+              for i in range(self.num_joints)]
+        pos = np.array([j[0] for j in js])
+        vel = np.array([j[1] for j in js])
+        ee = self._get_ee_pos()
+        diff = self.target_pos - ee
+        dist = np.linalg.norm(diff)
+        e_hist = np.mean(self.energy_window) if self.energy_window else 0.0
+        return np.concatenate(
+            [pos, vel, diff, [dist], [e_hist]]).astype(np.float32)
+
+    def step(self, action):
+        action = np.clip(action, -1, 1)
+        js = [p.getJointState(self.robot, i)
+              for i in range(self.num_joints)]
+        cur_pos = np.array([j[0] for j in js])
+        new_pos = np.clip(
+            cur_pos + action * 0.1,
+            [l for l, h in self.joint_limits],
+            [h for l, h in self.joint_limits])
+
+        torques = []
+        for i in range(self.num_joints):
+            p.setJointMotorControl2(
+                self.robot, i, p.POSITION_CONTROL,
+                targetPosition=new_pos[i],
+                force=200, maxVelocity=2.0)
+            torques.append(p.getJointState(self.robot, i)[3])
+
+        p.setJointMotorControl2(
+            self.robot, 6, p.POSITION_CONTROL, 0, force=0)
+        p.stepSimulation()
+        self.step_count += 1
+
+        torques = np.array(torques)
+        vels = np.array([p.getJointState(self.robot, i)[1]
+                        for i in range(self.num_joints)])
+
+        energy = np.sum(np.abs(torques * vels)) * self.dt
+        self.energy_window.append(energy)
+        self.total_energy += energy
+
+        jerk = np.sum(np.abs(torques - self.prev_torques)) / self.dt
+        self.prev_torques = torques.copy()
+        self.total_jerk += jerk
+
+        ee = self._get_ee_pos()
+        error = np.linalg.norm(self.target_pos - ee)
+
+        # Reward
+        w1, w2, w3 = 0.65, 0.20, 0.15
+        tracking_r = -w1 * error * 20
+        energy_p = -w2 * np.sum(np.abs(torques)) * 0.001
+        jerk_p = -w3 * jerk * 0.000005
+        progress_r = 0
+        if self.prev_error is not None:
+            progress_r = (self.prev_error - error) * 30
+        self.prev_error = error
+        success_b = 50.0 if error < 0.02 else 0.0
+        reward = tracking_r + energy_p + jerk_p + progress_r + success_b
+
+        terminated = error < 0.02
+        truncated = self.step_count >= self.max_steps
+
+        return self._get_state(), reward, terminated, truncated, {
+            'tracking_error_mm': error * 1000,
+            'energy_J': energy,
+            'jerk': jerk,
+            'success': error < 0.05
+        }
+
+    def close(self):
+        p.disconnect()
+
+# ================================
+# Training Callback
+# ================================
+class TrainingCallback(BaseCallback):
+    def __init__(self):
+        super().__init__()
+        self.episode_rewards = []
+        self.episode_errors = []
+        self.current_reward = 0
+        self.current_errors = []
+
+    def _on_step(self):
+        self.current_reward += self.locals['rewards'][0]
+        info = self.locals['infos'][0]
+        if 'tracking_error_mm' in info:
+            self.current_errors.append(info['tracking_error_mm'])
+
+        if self.locals['dones'][0]:
+            self.episode_rewards.append(self.current_reward)
+            if self.current_errors:
+                self.episode_errors.append(np.mean(self.current_errors))
+            self.current_reward = 0
+            self.current_errors = []
+
+            ep = len(self.episode_rewards)
+            if ep % 50 == 0:
+                avg_r = np.mean(self.episode_rewards[-50:])
+                avg_e = np.mean(self.episode_errors[-50:]) if self.episode_errors else 0
+                print(f"Ep {ep:3d}/500 | "
+                      f"Reward: {avg_r:8.1f} | "
+                      f"Error: {avg_e:6.1f}mm")
+        return True
+
+# ================================
+# Run Training
+# ================================
+print("Setting up environment...")
+env = ArmEnv()
+callback = TrainingCallback()
+
+print("Creating SAC agent...")
+model = SAC(
+    "MlpPolicy", env,
+    learning_rate=3e-4,
+    buffer_size=500000,
+    batch_size=256,
+    gamma=0.99,
+    tau=0.005,
+    ent_coef=0.2,
+    verbose=0,
+    device="cuda"
+)
+
+print("Training started...")
+print("="*60)
+model.learn(
+    total_timesteps=500*200,
+    callback=callback,
+    progress_bar=True
+)
+print("="*60)
+print("Training Complete!")
+if callback.episode_errors:
+    print(f"Final Error: {np.mean(callback.episode_errors[-50:]):.1f}mm")
