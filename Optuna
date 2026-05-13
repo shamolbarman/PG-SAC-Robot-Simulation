@@ -1,0 +1,58 @@
+# Block 5: Optuna Optimization
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    w1 = trial.suggest_float('w1', 0.4, 0.9)
+    w2 = trial.suggest_float('w2', 0.1, 0.4)
+    w3 = 1.0 - w1 - w2
+    if w3 < 0.05:
+        return float('inf')
+
+    test_env = ArmEnv()
+    state, _ = test_env.reset()
+    total_reward = 0
+
+    for _ in range(100):
+        with torch.no_grad():
+            s = torch.FloatTensor(state).unsqueeze(0).to(device)
+            action, _ = actor(s)
+            action = action.cpu().numpy()[0]
+        state, reward, term, trunc, info = test_env.step(action)
+        error = info['tracking_error_mm']
+        energy = info['energy_J']
+        jerk = info['jerk']
+        reward = -(w1 * error + w2 * energy * 10 + w3 * jerk * 0.001)
+        total_reward += reward
+        if term or trunc:
+            break
+
+    test_env.close()
+    return -total_reward
+
+print("Optuna Optimization started...")
+study = optuna.create_study(direction='minimize')
+study.optimize(objective, n_trials=50, show_progress_bar=True)
+
+print(f"\n Best w1: {study.best_params['w1']:.3f}")
+print(f"Best w2: {study.best_params['w2']:.3f}")
+print(f"Best w3: {1-study.best_params['w1']-study.best_params['w2']:.3f}")
+
+# Optuna Graph
+trials = [t.number for t in study.trials]
+w1_values = [t.params['w1'] for t in study.trials]
+best_w1 = study.best_params['w1']
+
+plt.figure(figsize=(8,5))
+plt.scatter(trials, w1_values, color='blue', alpha=0.6)
+plt.axhline(y=best_w1, color='red', linestyle='--',
+            label=f'Best w1 = {best_w1:.3f}')
+plt.title('Optuna Hyperparameter Optimization (w1)')
+plt.xlabel('Trial Number')
+plt.ylabel('Weight Value (w1)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('optuna_optimization.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Optuna graph saved!")
