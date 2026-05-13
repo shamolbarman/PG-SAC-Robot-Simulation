@@ -1,0 +1,14 @@
+# Round 3
+print("Round 3 Training...")
+print("="*60)
+
+model.learn(
+    total_timesteps=500*200,
+    callback=callback,
+    reset_num_timesteps=False,
+    progress_bar=True
+)
+
+print("="*60)
+print("Round 3 Complete!")
+print(f"Final Error: {np.mean(callback.episode_errors[-50:]):.1f}mm")
