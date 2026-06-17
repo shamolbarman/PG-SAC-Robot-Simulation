@@ -1,2 +1,2 @@
 # PG-SAC-Robot-Simulation
-Energy-Efficient 6-DOF Robot Control using Physics-Guided SAC (PyBullet Simulation)
+Physics-Guided Energy-Efficient Trajectory Planning for a 6-DOF Industrial Manipulator Using Soft Actor-Critic Reinforcement Learning
